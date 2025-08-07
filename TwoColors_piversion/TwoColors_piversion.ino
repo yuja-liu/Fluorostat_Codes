@@ -1,3 +1,8 @@
+// CHANGES IN V5:
+// Functions modified: turbidostat_cyano_air() and turbidostat_cyano_airLD()
+// Adds a brief bubbling step after pumping in new media and
+// before measuring the OD again. Ensuring the media is well mixed.
+
 #include <SPI.h>
 #include "Adafruit_MAX31855.h"
 
@@ -21,31 +26,37 @@ Adafruit_MAX31855 thermocouple(CLK, CS, DO);
 //color 1&2 pins
 #define ExciteLEDRefPin A6
 
+enum Err_flag { info, warning, error };
+
+enum LD_mode { LD, binary, sinusoid };
+
 //-------------------------------------------------------
 // Manually set variables
 //-------------------------------------------------------
-float temperature_SetTo = 30;//37; Temperature Thresh
-int target_OD = 700; //OD voltage set point for turbidostat
+float temperature_SetTo = 30; //Temperature Thresh
+// int target_OD = 647; //OD voltage set point for turbidostat
 int Fluorostat_target_channel = 0;
 int Fluorostat_target_gain = 36; //26,31,36,41,46,51
 //int Fluorostat_target=200;
 int Target_fluoro[2] = {200, 200};
 
 //LD Variables---------------
-long delaytime = ((3L * 60L + 50L) * 1000L * 60L); //num mils to night
+// long delaytime = ((3L * 60L + 40L) * 1000L * 60L); //num mins to night   // maybe change later
 //(hr to night x conversion from hr to min + min to night)x conversion from mils to secs * conversion from secs to mins
-long transtime = (15 * 1000 * 3600L);
+// long daylength = (12L * 1000L * 3600L);
+// long nightlength = (12L * 1000L * 3600L);
+// long transtime = 0; // if the lights are on initially then this should be equal to the daylength. I made a boolean check set this in setup, so the value here doesn't really matter.
 //num hours for day and night x conversion froms mils to secs x conversion secs to hours
-int num_skips = 4; //If you don't want to take fluoroscence measurements every time define this
-int current_skip = 0;
+// int num_skips = 4; //If you don't want to take fluoroscence measurements every time define this
+// int current_skip = 0;
 
 //Chemostat Variables--------
-long chem_starttime = millis();
-long chem_pump_interval = (2 * 1000 * 3600L);
+// long chem_starttime = millis();
+// long chem_pump_interval = (2 * 1000 * 3600L);
 //-------------------------------------------------------
 
 //for when the media runs out, counter of how many times the pumps have gone on initialize
-int counter = 0;
+// int counter = 0;
 
 const char PMTReadingPin[2] = {A3, A9};
 const char ExciteLEDPin[2] = {A0, A7};
@@ -81,7 +92,7 @@ int LEDGainInput[2] = {0, 0};
 int LastPMTRead[2] = {0, 0};
 int FluoroTargetRead = 0;
 int LastPMTGain[2] = {0, 0};
-int LastODRead = 0;
+float LastODRead = 0;
 int LastTempRead = 0;
 int LastLiquidLevel = 0;
 
@@ -90,12 +101,40 @@ int StirStatus = 0;
 int HeaterStatus = 0;
 int PumpInStatus = 0;
 int PumpOutStatus = 0;
-int LevelLEDStatus = 0;
+int LevelLEDStatus = 1;    // default to dark
 
 //int incomingByte = 0; // for incoming serial data
-bool LightsOn = true; //whether the lights are on or not
+//bool LightsOn = true; //whether the lights are on or not
 long starttime = millis();
 long timeleft = 0;
+
+const float TARGET_OD_VOLT_RATIO = 380.0;
+const int AIR_PUMP_OFF_DELAY = 10;    // seconds
+const int AIR_PUMP_MIXING_DELAY = 60;    //seconds
+const int MEASURE_INTERVAL = 900;    // seconds
+const int PUMP_OUT_DURATION = 20;    // seconds
+const int PUMP_IN_DURATION = 10;    // seconds
+const float OD_CHANGE_THRESHOLD = 0.05;
+
+unsigned long last_timestamp = 0;
+unsigned long last_pump_in = -1000000000;
+
+LD_mode mode = binary;
+// The two sets of parameters are mutually exclusive
+// E.g. if mode == LD, LD_VEC will be ignored
+
+// After a light period of $first_day_length,
+// it'll go through DL cycles with the durations set by
+// $night_length and $day_length
+const int DAY_LENGTH = 5;    // minutes
+const int NIGHT_LENGTH = 5;    // minutes
+const int FIRST_DAY_LENGTH = 5;    // minutes
+
+const int N_STEPS = 5;
+const char LD_VEC[N_STEPS + 1] = "LLDLD";
+const int LENGTH_VEC[N_STEPS] = {5*60, 24*60, 12*60, 12*60, 12*60};    // minutes
+// how long does it have to wait to begin LD step i?
+int wait_vec[N_STEPS];
 
 // the setup routine runs once when you press reset:
 void setup() {
@@ -118,13 +157,30 @@ void setup() {
   PMT_SET(0, InitialPMTGain[0]);
   ExciteLED_SET(1, InitialLEDGain[1]);
   PMT_SET(1, InitialPMTGain[1]);
-  Heater_OFF();
+  //Heater_OFF();
   //stir(5);
-  wait(5);
+  //delay(5000);
 
   ExciteLED_OFF(0);
   //OD_calib();
-  Heater_OFF();
+  //Heater_OFF();
+
+  /*if (LightsOn) { // Only relevant for turbidostat_cyano_airLD
+    transtime = daylength; // There is probably a better way to do this but here is a temporary fix for specifying photoperiod - AFS 23/04/25
+  }
+  else {
+    transtime = nightlength;
+  }*/
+
+  // fill wait_vec
+  if (mode == binary) {
+    wait_vec[0] = LENGTH_VEC[0];
+    for (int i = 1; i < N_STEPS; i++) {
+      wait_vec[i] = wait_vec[i - 1] + LENGTH_VEC[i];
+    }
+  }
+
+  msg("Machine online", info);
 }
 
 //----------------------------------------------
@@ -165,28 +221,21 @@ void ODLED_OFF() {
   send_data();
   delay(100);
 }
-void Stir_ON() {
-  digitalWrite(AirPin, HIGH);
-  StirStatus = 1;
-  send_data();
-  delay(100);
-}
-void Stir_OFF() {
-  digitalWrite(AirPin, LOW);
-  StirStatus = 0;
-  send_data();
-  delay(100);
-}
+
 void Heater_ON() {
+  if (!HeaterStatus) {
+    //send_data();
+  }
   digitalWrite(HeaterPin, LOW);
   HeaterStatus = 1;
-  send_data();
   delay(100);
 }
 void Heater_OFF() {
+  if (HeaterStatus) {
+    //send_data();
+  }
   digitalWrite(HeaterPin, HIGH);
   HeaterStatus = 0;
-  send_data();
   delay(100);
 }
 void PumpIn_ON() {
@@ -215,14 +264,20 @@ void PumpOut_OFF() {
 }
 void LevelLED_ON() {
   digitalWrite(LevelLEDPin, HIGH);
-  LevelLEDStatus = 1;
-  send_data();
+  /*if (!LevelLEDStatus) {
+    //msg("LED switched Off", info);
+    //send_data();
+  }
+  LevelLEDStatus = 1;*/
   delay(100);
 }
 void LevelLED_OFF() {
   digitalWrite(LevelLEDPin, LOW);
-  LevelLEDStatus = 0;
-  send_data();
+  /*if (LevelLEDStatus) {
+    msg("LED switched on", info);
+    //send_data();
+  }
+  LevelLEDStatus = 0;*/
   delay(100);
 }
 
@@ -231,7 +286,7 @@ void AirPin_ON() {
   digitalWrite(AirPin, HIGH);
   delay(100);
   StirStatus = 1;
-  send_data();
+  //send_data();
   delay(100);
 
 }
@@ -240,67 +295,8 @@ void AirPin_OFF() {
   digitalWrite(AirPin, LOW);
   delay(100);
   StirStatus = 0;
-  send_data();
+  //send_data();
   delay(100);
-}
-
-//----------------------------------------------
-
-void turbido_pump(int duration, int ODSet) {
-
-  if (LastODRead < ODSet) {
-    //stir(10);
-    pump_out(duration); // in case the water level too high
-    PumpIn_ON();
-
-    for (int i = 0; i < duration; i++) {
-      delay(1000);
-    }
-
-    PumpIn_OFF();
-
-    //stir(10);
-    delay(2000);//2s
-    temperature_measurements_and_set_peltier();
-    pump_out(duration * 2); // motors pump fluid out (for tudbidostat),4 times PumpOut time than PumpIn time
-    pump_off();//make sure that the pump is off
-  }
-
-  else { /// just in case
-    //stir(10);
-    pump_out(duration);
-    pump_off();
-  }
-}
-
-//----------------------------------------------
-
-
-void Fluoro_pump(int FluoroSet, int duration) {
-
-  if (FluoroTargetRead > FluoroSet) {
-    stir(10);
-    pump_out(duration); // in case the water level too high
-    PumpIn_ON();
-
-    for (int i = 0; i < duration; i++) {
-      delay(1000);
-    }
-
-    PumpIn_OFF();
-
-    stir(10);
-    delay(2000);//2s
-    temperature_measurements_and_set_peltier();
-    pump_out(duration * 4); // motors pump fluid out (for tudbidostat),4 times PumpOut time than PumpIn time
-    pump_off();//make sure that the pump is off
-  }
-
-  else { /// just in case
-    stir(10);
-    pump_out(duration);
-    pump_off();
-  }
 }
 
 
@@ -328,12 +324,7 @@ void pump_off() {
   PumpOut_OFF();
 }
 
-//----------------------------------------------
-void wait(int duration) {
-  for (int i = 0; i < duration; i++) {
-    delay(1000);
-  }
-}
+
 //----------------------------------------------
 void temperature_measurements_and_set_peltier() { // N seconds
   /////////Temp Measurements
@@ -348,22 +339,13 @@ void temperature_measurements_and_set_peltier() { // N seconds
     Heater_OFF();
 }
 
-//----------------------------------------------
-
-void stir(int duration) {
-  Stir_ON();
-  for (int i = 0; i < duration; i++) {
-    delay(1000);
-  }
-  Stir_OFF();
-}
 
 //----------------------------------------------
-void  PMT_rolling_measurements(int which) {
+void PMT_rolling_measurements(int which) {
   for (int k = 0; k < PMTGainCap[which] + 1; k++) {
     set_PMT_from_internal(which);//rolling PMT
     PMTSet_measurements(which, LEDGain[which], PMTGain[which]);
-    wait(1);
+    delay(1000);
     //stir(5);
     //wait(2);
   }
@@ -400,52 +382,6 @@ void set_PMT_from_internal(int which) {
   }
 }
 
-void set_PMT_from_internal2(int which) {
-  //////////////////////////////////////////////////////////////////////Decide what to set
-  if (LastPMTRead[which] < 900 && LastPMTRead[which] > 200) { // when signal voltage is in good range
-    if (PMTGainCurrent[which] < PMTGainCap[which]) {
-      PMTGainCurrent[which]++;      // increase PMT Gain
-    }
-    if (PMTGainCurrent[which] == PMTGainCap[which]) {
-      PMTGainCurrent[which] = 0;             // when hit max PMT gain, reset PMT Gain to min PMT gain
-    }
-  }
-
-  if (LastPMTRead[which] < 200) { // when signal voltage is too weak
-    if (PMTGainCurrent[which] < PMTGainCap[which]) {
-      PMTGainCurrent[which]++;      // increase PMT Gain
-    }
-    if (PMTGainCurrent[which] == PMTGainCap[which]) {
-      if (PMTGainCap[which] < 6) {
-        PMTGainCap[which]++;
-        PMTGainCurrent[which] = 0;
-      }
-      else {
-        PMTGainCap[which] = 6;
-        PMTGainCurrent[which] = 0;
-      }
-    }
-  }
-
-  if (LastPMTRead[which] > 900) {        //when signal voltage is to high
-    if (PMTGainCap[which] > 0) {      // if  the max PMT gain is not yet set to 0
-      PMTGainCap[which] = PMTGainCurrent[which] - 1;      // set the max PMT gain as 1 level lower than the current PMT gain
-      PMTGainCurrent[which] = 0;           //reset PMT Gain to min PMT gain
-    }
-    else {            // if  the max PMT gain has set to 0
-      PMTSwitch[which] = 0;  // stop using PMT
-    }
-  }
-  //////////////////////////////////////////////////////////////////////SET
-  if (PMTSwitch[which] != 0) { // continue using PMT
-    LEDGain[which] = 255;
-    PMTGain[which] = int(26 + 5 * float(PMTGainCurrent[which]));
-  }
-  else {              // stop using PMT
-    LEDGain[which] = 0;
-    PMTGain[which] = 0;
-  }
-}
 
 //----------------------------------------------
 void PMTSet_measurements(int Which, int LedG, int PmtG) {
@@ -518,34 +454,6 @@ void OD_signal_read() {
   temperature_measurements_and_set_peltier();
 }
 
-void LevelSensing() {
-
-  float Levelsensor = 0;
-  float LevelLEDsensor = 0;
-  int i = 0;
-  int NumOfPoints = 50;
-  //int NumOfPoints=1;
-  Heater_OFF(); // for LED stablize
-  delay(500);
-  LevelLED_ON();
-  delay(1000);
-
-  for (i = 0; i < NumOfPoints; i++) {
-    delay(500);
-    Levelsensor = Levelsensor + analogRead(LevelSensorPin);
-    delay(500);
-    LevelLEDsensor = LevelLEDsensor + analogRead(LevelLEDSensorPin);
-  }
-  LevelODLEDrf = float(LevelLEDsensor) / float(NumOfPoints);
-  LiquidLevel = float(Levelsensor) / float(NumOfPoints);
-  LastLiquidLevel = LiquidLevel;
-  send_data();
-  delay(50);
-  LevelLED_OFF();//turn off ODLED
-  delay(50);
-
-}
-
 //----------------------------------------------
 void CleanData() {
   PMTRead[0] = double(0);
@@ -573,7 +481,7 @@ void Printdata() {
 
   double data[] = {SensitivitySetTo[0], SenV0, ExcitationSetTo[0], ExcitationOutput[0], ExcitationRFRead[0], Target_fluoro[0], PMTRead[0],
                    SensitivitySetTo[1], SenV1, ExcitationSetTo[1], ExcitationOutput[1], ExcitationRFRead[1], Target_fluoro[1], PMTRead[1],
-                   target_OD, ODRead, temperature_SetTo, thermocouple_celcius, ODLEDStatus, StirStatus,
+                   TARGET_OD_VOLT_RATIO, ODRead, temperature_SetTo, thermocouple_celcius, ODLEDStatus, StirStatus,
                    HeaterStatus, PumpInStatus, PumpOutStatus, ODLEDrf, LevelLEDStatus, LiquidLevel, LevelODLEDrf
                   };
 
@@ -593,557 +501,149 @@ void send_data() {
   delay(100);
 }
 
-//.--------------------------------------------------------------algorithms--------------------------------------------------------------
-
-
-void Pump_for_Exp_Start() {
-
-  pump_out(4); // in case the water level too high
-  PumpIn_ON();
-  for (int i = 0; i < 4; i++) {
-    delay(1000);
-  }
-  PumpIn_OFF();
-  stir(10);
-  delay(2000);//2s
-  temperature_measurements_and_set_peltier();
-  pump_out(10); // motors pump fluid out (for tudbidostat),4 times PumpOut time than PumpIn time
-  pump_off();//make sure that the pump is off
-
+void msg(const char* message, Err_flag flag) {
+  Serial.print(-1);    // flag for message
+  Serial.print(" ");
+  Serial.print(flag);
+  Serial.print(" ");
+  Serial.print(message);
+  Serial.println();
 }
 
-
-void Thorlab() {
-  //temperature_measurements_and_set_peltier();
-  ExcitationRFRead[0] = int(analogRead(ExciteLEDRefPin));
-  send_data();
+float get_light_intensity() {
+  return 0.0;
 }
 
-void turbidostat(int targetOD) {
-  target_OD = targetOD;
+bool is_light() {
+  unsigned long cur_t = millis();
 
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  PMT_rolling_measurements(0);
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  OD_signal_read();
-
-  //stir(10);
-  //temperature_measurements_and_set_peltier();
-  //PMT_rolling_measurements(1);
-  //stir(10);
-  //temperature_measurements_and_set_peltier();
-  //OD_signal_read();
-
-  //stir(10);
-
-  ////////for turbido
-  for (int i = 0; i < 3; i++) { //3 times make sure dilute enough
-    temperature_measurements_and_set_peltier();
-    wait(1);
-    turbido_pump(2, targetOD); // 2 secs pump in, in case of overflow
-    LevelSensing();
+  if (mode == LD) {
+    if (cur_t <= FIRST_DAY_LENGTH*60000) {
+      return true;
+    } else {
+      unsigned long remainder = (cur_t - FIRST_DAY_LENGTH*6000)%(DAY_LENGTH*60000 + NIGHT_LENGTH*60000);
+      return remainder > NIGHT_LENGTH*60000;
+    }
+  } else if (mode == binary) {
+    for (int i = 0; i < N_STEPS; i++) {
+      if (cur_t < wait_vec[i]*60000) {
+        return LD_VEC[i] == 'L';
+      }
+    }
+    return true;     // keep lights on after the program
+  } else {
+    // this function will not be called in analog mode
+    return false;
   }
 }
 
-//Same as the turbidostat code, but turns the lights on when not taking OD or fluorescence measurements.
-void turbidostat_cyano(int targetOD) {
-  target_OD = targetOD;
-  LevelLED_ON();
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  LevelLED_OFF();
-  //PMT_rolling_measurements(0);
-  LevelLED_ON();
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  LevelLED_OFF();
-  OD_signal_read();
-
-  LevelLED_ON();
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  LevelLED_OFF();
-  //PMT_rolling_measurements(1);
-  LevelLED_ON();
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  LevelLED_OFF();
-  OD_signal_read();
-
-  LevelLED_ON();
-  stir(10);
-
-  ////////for turbido
-  for (int i = 0; i < 3; i++) { //3 times make sure dilute enough
-    temperature_measurements_and_set_peltier();
-    wait(1);
-    turbido_pump(2, targetOD); // 2 secs pump in, in case of overflow
-    LevelSensing();
-  }
-}
-
-void fluorostat(int channel, int target) {
-
-  target_OD = 0;
-  Target_fluoro[0] = 1000;
-  Target_fluoro[1] = 1000;
-  Target_fluoro[channel] = target;
-
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  PMT_rolling_measurements(0);
-  stir(10);
-  temperature_measurements_and_set_peltier();
-  OD_signal_read();
-
-  //stir(10);
-  //temperature_measurements_and_set_peltier();
-  //PMT_rolling_measurements(1);
-  //stir(10);
-  //temperature_measurements_and_set_peltier();
-  //OD_signal_read();
-
-  stir(10);
-
-  ////////for fluorostat
-  for (int i = 0; i < 3; i++) { //3 times make sure dilute enough
-    temperature_measurements_and_set_peltier();
-    wait(1);
-    Fluoro_pump(target, 2); //(channel, target reading, secs pump in)
-    LevelSensing();
-  }
-}
-
-
-void batch() {
-
-  ////batch
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  PMT_rolling_measurements(0);
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  OD_signal_read();
-
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  PMT_rolling_measurements(1);
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  OD_signal_read();
-}
-
-
-void ODbatch() {
-
-  ////batch
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  //PMT_rolling_measurements(0);
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  OD_signal_read();
-
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  //PMT_rolling_measurements(1);
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  OD_signal_read();
-}
-
-void ODbatch_light() {
-
-  ////batch
-  //ExciteLED_SET(0 , 255);
-  LevelLED_OFF();
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  //ExciteLED_OFF(0);
-
-  LevelLED_ON();
-  if ( current_skip % num_skips == 0) {
-    //PMT_rolling_measurements(0);
-  }
-  //ExciteLED_SET(0 , 255);
-  stir(10);
-  //ExciteLED_OFF(0);
-  //LevelLED_ON();
-  OD_signal_read();
-  //ExciteLED_SET(0 , 255);
-  LevelLED_OFF();
-
-  for (int i = 0; i < 180; i++) { //15 min of stirring
-    stir(5);
-    temperature_measurements_and_set_peltier();
-  }
-  ++num_skips;
-}
-
-long timetillevent(long stime, long ttime, long dtime) {
-  long offset = ttime - dtime;
-  long now = millis();
-  long timepassed = now - stime;
-  long timetill = ttime - (timepassed + offset);
-  //Serial.println("Time until switch:");
-  //Serial.println(timetill);
-  return timetill;
-}
-
-long countdown(long stime, long ttime) {
-  long now = millis();
-  long timepassed = now - stime;
-  long timetill = ttime - (timepassed);
-  //Serial.println("Time until switch:");
-  //Serial.println(timetill);
-  return timetill;
-}
-
-void ODbatch_light_LD(long stime, long ttime, long dtime) {
-  starttime = stime;
-  delaytime = dtime;
-  //
-  //  //if (Serial.available() > 0) {
-  //  // read the incoming byte:
-  //  //incomingByte = Serial.read();
-  //
-  //  // say what you got:
-  //  //Serial.println(incomingByte);
-  //  //49 byte means 1 (true)
-  //  //48 byte means 0 (false)
-  //  //if(incomingByte == 49){
-  //  //    Lightson = true;
-  //  //  }
-  //  //}
-  //  //if(incomingByte == 48){
-  //  //    Lightson = false;
-  //
-  //  // }
-  timeleft = timetillevent(stime, ttime, dtime);
-  //Serial.println(timeleft);
-  if (timeleft < 1000) {
-    starttime = millis();
-    delaytime = transtime;
-    LightsOn = !LightsOn;
-  }
-
-
-  ////batch
-  //ExciteLED_SET(0 , 255);
-  if (LightsOn) {
-    LevelLED_OFF();
-  }
-  stir(5);
-  temperature_measurements_and_set_peltier();
-  //ExciteLED_OFF(0);
-  //
-  //ExciteLED_SET(0 , 255);
-  stir(10);
-  //ExciteLED_OFF(0);
-  LevelLED_ON();
-  OD_signal_read();
-  PMT_rolling_measurements(0);
-  //ExciteLED_SET(0 , 255);
-  if (LightsOn) {
-    LevelLED_OFF();
-  }
-  for (int i = 0; i < 100; i++) {
-    stir(5);
-    temperature_measurements_and_set_peltier();
-  }
-}
-//void toarduino(){
-//  if (Serial.available() > 0) {
-//    // read the incoming byte:
-//    incomingByte = Serial.read();
-//    Serial.print(incomingByte);
-//    delay(5000);
-//
-//    if(incomingByte == 49){
-//        LightsOn = true;
-//      }
-//    }
-//    if(incomingByte == 48){
-//        LightsOn = false;
-//    }
-//  if (LightsOn){
-//    LevelLED_OFF();
-//  }
-//  else{
-//    LevelLED_ON();
-//  }
-//  }
-void ODbatch_light_air() {
-
-  ////batch
-  //ExciteLED_SET(0 , 255);
-  LevelLED_OFF();
-  AirPin_ON();
-  //stir(5);
-  temperature_measurements_and_set_peltier();
-  //ExciteLED_OFF(0);
-
-  //PMT_rolling_measurements(0);
-  //ExciteLED_SET(0 , 255);
-  //stir(10);
-  //ExciteLED_OFF(0);
-
-  AirPin_OFF();
-  wait(30);
-  LevelLED_ON();
-  OD_signal_read();
-  //ExciteLED_SET(0 , 255);
-  LevelLED_OFF();
-  AirPin_ON();
-
-  for (int i = 0; i < 180; i++) { //15 minutes between readings
-    wait(5);
-    temperature_measurements_and_set_peltier();
-    //AirPin_ON();
-    wait(5);
-  }
-}
-
-void ODbatch_light_air_PMT() {
-
-  ////batch
-  //ExciteLED_SET(0 , 255);
-  LevelLED_OFF();
-  AirPin_ON();
-  //stir(5);
-  temperature_measurements_and_set_peltier();
-  //ExciteLED_OFF(0);
-
-
-  //ExciteLED_SET(0 , 255);
-  //stir(10);
-  //ExciteLED_OFF(0);
-  LevelLED_ON();
-  AirPin_OFF();
-  OD_signal_read();
-  PMT_rolling_measurements(0);
-  //ExciteLED_SET(0 , 255);
-  LevelLED_OFF();
-  AirPin_ON();
-
-  for (int i = 0; i < 100; i++) {
-    temperature_measurements_and_set_peltier();
-    wait(5);
-  }
-
-
-}
-
-//Same as the turbidostat code, but turns the lights on when not taking OD or fluorescence measurements.
-void chemostat_cyano_air(long chem_pump_interval, long starttime) {
-  chem_starttime = starttime;
-  LevelLED_OFF();
-  AirPin_ON();
-
-
-  temperature_measurements_and_set_peltier();
-
-
-  AirPin_OFF();
-  wait(30);
-  LevelLED_ON();
-
-  pump_out(5);
-
-  //wait(10);
-  OD_signal_read();
-  //
-  //ExciteLED_SET(0 , 255);
-  //PMT_rolling_measurements(0);
-
-  LevelLED_OFF();
-  ////////for turbido
-
-  timeleft = countdown(chem_starttime, chem_pump_interval);
-
-  Serial.println(timeleft);
-  if (timeleft < 1000) {
-    //Serial.println("True \n");
-    chem_starttime = millis();
-    for (int i = 0; i < 1; i++) { //3 times make sure dilute enough
-      temperature_measurements_and_set_peltier();
-      wait(1);
-      pump_out(5);
-      pump_in(5);
-      pump_out(10);
+void update_light() {
+  // set the status of the LED ring
+  if (mode == sinusoid) {
+    // TODO: "continuously" tuning the brightness
+  } else {
+    bool light_status = is_light();
+    if (light_status) {
+      if (LevelLEDStatus) {
+        msg("LED switched on", info);
+        send_data();
+      }
+      LevelLED_OFF();    // turn lights on
+      LevelLEDStatus = false;
+    } else {
+      if (!LevelLEDStatus) {
+        msg("LED switched off", info);
+        send_data();
+      }
+      LevelLED_ON();    // turn lights off
+      LevelLEDStatus = true;
     }
   }
-
-  AirPin_ON();
-  LevelLED_OFF();
-
-  for (int i = 0; i < 180; i++) { //15 minutes between readings
-    wait(5);
-    temperature_measurements_and_set_peltier();
-    //AirPin_ON();
-    wait(5);
-  }
-  delay(3000);
-
 }
 
-void turbidostat_cyano_air(int targetOD, int count) {
-  count = counter;
-  target_OD = targetOD;
-  LevelLED_OFF();
+void turbidostat(int PMT_id) {
+  // PMT_id == -1 means off
+
+  // housekeeping
+  update_light();
   AirPin_ON();
-
-
   temperature_measurements_and_set_peltier();
 
+  unsigned long cur_time = millis();
+  if (cur_time - last_timestamp > MEASURE_INTERVAL*1000L) {
+    // update timestamp
+    last_timestamp += MEASURE_INTERVAL*1000L;
 
-  AirPin_OFF();
-  wait(45);
-  LevelLED_ON();
+    // measure OD and fluorescence
+    AirPin_OFF();    // turn off bubbling
+    delay(AIR_PUMP_OFF_DELAY*1000L);
+    LevelLED_ON();    // turn off LED ring
 
-  pump_out(5);
-
-  //wait(10);
-  OD_signal_read();
-  //
-  //ExciteLED_SET(0 , 255);
-  //PMT_rolling_measurements(0);
-
-  LevelLED_OFF();
-  ////////for turbido
-  while ( LastODRead < targetOD and count < 10) {
-    for (int i = 0; i < 1; i++) { //3 times make sure dilute enough
-      temperature_measurements_and_set_peltier();
-      wait(1);
-      turbido_pump(10, targetOD); // 2 secs pump in, in case of overflow
+    if (PMT_id >= 0) {
+      PMT_rolling_measurements(PMT_id);
     }
-    count = count + 1;
-    LevelLED_ON();
+
     OD_signal_read();
-    LevelLED_OFF();
-  }
-  if (count > 9) {
-    counter = 10;
-  }
 
-  AirPin_ON();
-  LevelLED_OFF();
-  for (int i = 0; i < 180; i++) { //15 minutes between readings
-    wait(5);
-    temperature_measurements_and_set_peltier();
-    //AirPin_ON();
-    wait(5);
-  }
+    // Higher OD gives lower volt ratio
+    if (LastODRead < TARGET_OD_VOLT_RATIO) {
+      update_light();
 
+      // back-to-back dilutions?
+      if (cur_time - last_pump_in < 2*MEASURE_INTERVAL*1000L) {
+        msg("Consecutive dilutions. You may want to increase "
+        "pump-in duration or shortern measure interval.", warning);
+      } else {
+        msg("Being diluted", info);
+      }
+      last_pump_in = cur_time;    //update
+
+      // dilute
+      pump_out(PUMP_OUT_DURATION);    // make sure brings back the total vol
+      pump_in(PUMP_IN_DURATION);
+      pump_off();    // turn off all pumps
+
+      // Get the OD immediately after the dilution
+      // will be useful in estimating the dilution factor
+      // Bubble to mix
+      AirPin_ON();
+      delay(AIR_PUMP_MIXING_DELAY*1000L);
+      AirPin_OFF();
+
+      float previous_OD = LastODRead;
+      LevelLED_ON();    // turn off lights
+      OD_signal_read();
+      float frac_change = abs(LastODRead - previous_OD)/previous_OD;
+      if (frac_change < OD_CHANGE_THRESHOLD) {
+        msg("Dilution failed. Immediately check for pump failure, liquid overflow, "
+        "sensor failure, or biofilm build-up", error);
+      }
+    }
+  }
 }
-//Same as the turbidostat code, but turns the lights on when not taking OD or fluorescence measurements.
-void turbidostat_cyano_air_LD(int targetOD, long stime, long dtime, int count) {
-  pump_out(5);
-  starttime = stime;
-  delaytime = dtime;
-  target_OD = targetOD;
-  count = counter;
-  if (LightsOn) {
-    LevelLED_OFF();
-  }
-  AirPin_ON();
 
-
-  timeleft = timetillevent(starttime, transtime, dtime);
-  //Serial.println(timeleft);
-  if (timeleft < 1000) {
-    starttime = millis();
-    delaytime = transtime;
-    LightsOn = !LightsOn;
-  }
-  if (LightsOn) {
-    LevelLED_OFF();
-  }
-
-
+void pump_test() {
+  update_light();
   temperature_measurements_and_set_peltier();
 
-
+  AirPin_ON();
+  delay(10000);
   AirPin_OFF();
-  wait(45);
-  LevelLED_ON();
 
-  pump_out(5);
-
-  //wait(10);
-  OD_signal_read();
-  //
-  //ExciteLED_SET(0 , 255);
-  PMT_rolling_measurements(0);
-
-  if (LightsOn) {
-    LevelLED_OFF();
-  }
-  ////////for turbido
-  while ( LastODRead < targetOD and count < 10) {
-    for (int i = 0; i < 1; i++) { //3 times make sure dilute enough
-      temperature_measurements_and_set_peltier();
-      wait(1);
-      turbido_pump(10, targetOD); // 2 secs pump in, in case of overflow
-    }
-    count = count + 1;
-    LevelLED_ON();
-    OD_signal_read();
-    if (LightsOn) {
-      LevelLED_OFF();
-    }
-  }
-  if (count > 9) {
-    counter = 10;
-  }
-
-  AirPin_ON();
-  if (LightsOn) {
-    LevelLED_OFF();
-  }
-  for (int i = 0; i < 180; i++) { //15 minutes between readings
-    wait(5);
-    temperature_measurements_and_set_peltier();
-    //AirPin_ON();
-    wait(5);
-  }
-
+  pump_out(PUMP_OUT_DURATION);    // make sure brings back the total vol
+  pump_in(PUMP_IN_DURATION);
 }
 
+void sensor_test(int PMT_id) {
+  AirPin_OFF();    // turn off bubbling
+  LevelLED_ON();    // turn off LED ring
 
+  if (PMT_id >= 0) {
+    PMT_rolling_measurements(PMT_id);
+  }
 
-void rolling_measure() {
-
-  target_OD = 0;
-  Target_fluoro[0] = 1000;
-  Target_fluoro[1] = 1000;
-
-  stir(10);
-  PMT_rolling_measurements(0);
-  stir(10);
   OD_signal_read();
 }
-
-void OD_calib() {
-
-  target_OD = 0;
-  OD_signal_read();
-  int it = 0;
-  while ( it < 5 ) {
-    stir(5);
-    //OD_calib();
-    it++;
-  }
-
-}
-
-void hold_temp() {
-  temperature_measurements_and_set_peltier();
-  wait(10);
-}
-
 
 
 //--------------------------------------------------------------modes--------------------------------------------------------------
@@ -1151,102 +651,6 @@ void hold_temp() {
 
 // the loop routine runs over and over again forever:
 void loop() {
-  //--------------------------------------------
-  //Choose one function to set turbidostat mode:
-  //--------------------------------------------
-  //turbidostat(target_OD);
-  //turbidostat_cyano(target_OD);
-  //fluorostat(Fluorostat_target_channel,Target_fluoro[Fluorostat_target_channel]);//(channel (0 or 1), gain, target reading)
-  //Pump_for_Exp_Start();
-  //rolling_measure();
-  //ODbatch();
-  //Thorlab();
-  //tbatch();
-  //OD_calib();
-  //
-  //pump_out(5);
-  //pump_in(5);
-  //wait(10);
-  //ODbatch_light();
-  //ODbatch_light_LD(starttime, transtime, delaytime);
-  //ODbatch_light_air();
-  //OD_signal_read();
-  //ODbatch_light_air_PMT();
-  //AirPin_ON();
-  //digitalWrite(AirPin, HIGH);
-  //hold_temp();
-  //turbidostat_cyano_air_LD(target_OD,starttime,delaytime,counter);
-  //turbidostat_cyano_air(target_OD,counter);
-
-  //chemostat_cyano_air(chem_pump_interval,chem_starttime);
-  //--------------------------------------------
-
-  //Test code:commented out
-  ////
-  //  AirPin_ON();
-  //  delay(5000);
-  //  AirPin_OFF();
-  //  delay(5000);
-  //  wait(30);
-  //  LevelLED_ON();
-
-  //pump_out(5);
-
-  //wait(10);
-  OD_signal_read();
-  //AirPin_ON();
-  //wait(10);
-  //Serial.println();
-  //Serial.println("Start Time: ");
-  //Serial.println(starttime);
-  //Serial.println("Photoperiod Length:");
-  //Serial.println(transtime);
-  //Serial.println("Time till First Night: ");
-  //Serial.println(delaytime);
-  //timeleft = timetillevent(starttime, transtime, delaytime);
-  //
-  //if (timeleft < 1000){
-  //    starttime = millis();
-  //    delaytime = transtime;
-  //}
-  //
-
-  //timeleft = countdown(chem_starttime, chem_pump_interval);
-  //Serial.print(timeleft);
-  //if (timeleft < 1000){
-  //  chem_starttime = millis();
-  //}
-
-  //delay(3000);
-
-  //ExciteLED_OFF(0);
-
-  //  AirPin_ON();
-  //  delay(5000);
-  //
-  //  AirPin_OFF();
-  //delay(60000);
-  //ExciteLED_SET(0,255);
-  //delay(3000);
-  //digitalWrite(AirPin, HIGH);
-  //PMT_rolling_measurements(0);
-  //delay(3000);
-  //stir(5);
-  //Stir_ON();
-  //delay(10000);
-  //toarduino();
-  //temperature_measurements_and_set_peltier();
-  //Heater_ON();
-  //  ODLED_ON();
-  //  AirPin_ON();
-  //LevelLED_OFF();
-  //PumpIn_ON();
-  //wait(5);
-  //PumpIn_OFF();
-  //PumpOut_ON();
-  //wait(15);
-  //PumpOut_OFF();
-
-  //Heater_OFF();
-  //LevelLED_ON();
+  
+  turbidostat(0);
 }
