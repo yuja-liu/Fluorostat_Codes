@@ -1,0 +1,20 @@
+{
+    "Title": "MRC1061 at 70uE",
+    "Mode": "Turbidostat",
+    
+    "LD_schedule": {
+        "Mode": "binary",
+        "String": "LLDLD",
+        "Durations": [5, 24, 12, 12],
+        "Duration_unit": "hour"
+    },
+    "Temp_set_point": 30.0,
+    "Turbidostat": {
+        "OD_volt_ratio_set_point": 380.0,
+        "Fluo_detecting": true
+    },
+    "Report": {
+        "Level": "verbose",
+        "Email": "rdfliu@uchicago.edu"
+    }
+}

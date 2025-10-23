@@ -130,9 +130,9 @@ const int DAY_LENGTH = 5;    // minutes
 const int NIGHT_LENGTH = 5;    // minutes
 const int FIRST_DAY_LENGTH = 5;    // minutes
 
-const int N_STEPS = 5;
-const char LD_VEC[N_STEPS + 1] = "LLDLD";
-const int LENGTH_VEC[N_STEPS] = {5*60, 24*60, 12*60, 12*60, 12*60};    // minutes
+const int N_STEPS = 4;
+const char LD_VEC[N_STEPS + 1] = "LDLD";
+const int LENGTH_VEC[N_STEPS] = {14*60, 12*60, 12*60, 12*60};    // minutes
 // how long does it have to wait to begin LD step i?
 int wait_vec[N_STEPS];
 
@@ -643,6 +643,12 @@ void sensor_test(int PMT_id) {
   }
 
   OD_signal_read();
+}
+
+void stand_by() {
+  LevelLED_OFF();
+  Heater_OFF();
+  pump_off();
 }
 
 
